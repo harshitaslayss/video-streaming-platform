@@ -195,19 +195,19 @@ public class EncodingService {
     private void generateMasterPlaylist(String masterPlaylistPath) throws IOException{
         StringBuilder master= new StringBuilder();
         master.append("#EXTM3U\n");
-        master.append("EXT-X-VERSION:3\n");
+        master.append("#EXT-X-VERSION:3\n\n");
 
         int[][] qualities= new int[][]{{1920,5000,1080},{1280,2800,720},{854,1200,480},{640,800,360}};
 
-        for(int[] quality: qualities){
+        for(int[] quality: VIDEO_QUALITIES){
             int width= quality[0];
             int bitrate= quality[1];
             int height= quality[2];
 
-            master.append("EXT-X-STREAM-INF:BANDWIDTH=")
-                    .append(bitrate*1000) //kbps to bits per second also bw==bitrate
+            master.append("#EXT-X-STREAM-INF:BANDWIDTH=")
+                    .append((bitrate+128)*1000) //kbps to bits per second also bw==bitrate
                     .append(",RESOLUTION=").append(width).append("x").append(height)
-                    .append(",CODECS=\"avc1.42e01e,mp4a.40.2\"\n");
+                    .append("\n");
             master.append(height).append("p/playlist.m3u8\n\n");
         }
 

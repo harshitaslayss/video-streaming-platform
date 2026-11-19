@@ -27,13 +27,14 @@ public class VideoUploadedEventConsumer {
     @KafkaListener(topics = "video.encoded")
     public void consumeVideoEncodedEvent(@Payload Map<String,Object> payload){
         String movieId= payload.get("movieId").toString();
-        String hlsUrl= payload.get("hlsUrl").toString();
         boolean success= (Boolean) payload.get("success");
 
         if(success){
+            String hlsUrl= payload.get("hlsUrl").toString();
             contentService.updateHlsUrl(movieId,hlsUrl);
         }else{
-            String errorMessage= payload.get("errorMessage").toString();
+            String errorMessage = String.valueOf(payload.get("errorMessage"));
+            log.error("Encoding failed for movie: {} - {}", movieId, errorMessage);
             contentService.updateMovieStatus(movieId, VideoStatus.FAILED);
         }
 

@@ -126,7 +126,7 @@ public class ContentService {
     }
 
     public void updateMovieStatus(String movieId, VideoStatus videoStatus){
-        Movie movie= contentRepository.findById(movieId).orElseThrow(()->new RuntimeException("Movie not found: {}"+ movieId));
+        Movie movie= contentRepository.findById(movieId).orElseThrow(()->new RuntimeException("Movie not found: "+ movieId));
         movie.setVideoStatus(videoStatus);
         contentRepository.save(movie);
     }

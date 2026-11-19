@@ -4,172 +4,134 @@ import com.netflix.streamingservice.dto.StreamingResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
-import software.amazon.awssdk.core.ResponseInputStream;
+import org.springframework.web.server.ResponseStatusException;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
-import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignRequest;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class StreamingService {
+
     private final S3Client s3Client;
     private final S3Presigner s3Presigner;
-    private final RedisTemplate<String,String> redisTemplate;
 
     @Value("${aws.s3.bucket-name}")
     private String bucketName;
 
     @Value("${aws.s3.presigned-url-expiry}")
-    private long presignedUrlExpiry; //60 minutes
+    private long presignedUrlExpiry; // minutes, applies to video segments
 
-    //Redis key for caching streaming Urls
-    private static final String STREAMING_URL_CACHING_PREFIX= "streaming:url";
+    @Value("${app.public-base-url}")
+    private String publicBaseUrl;
 
     /*
-    * Get streaming URL for a movie
-    * FLOW:
-    *
-    * 1. check redis cache for existing presigned URL
-    * 2. if cached- return immediately
-    * 3. if not cached- generate new presigned url from s3
-    * 4. cache the url in redis
-    * 5. return the streaming url
-    *
-    * why presigned url-> s3 bucket is private locker room- videos are not publicly accessible
-    * presigned url gives temp access (X minutes)
-    * prevent unauthorised access and video downloads
-    *
-    */
-    public StreamingResponse getStreamingUrl(String movieId, String playlistKey) {
-        log.info("get streaming url for movie: {}", movieId);
-        String cacheKey= STREAMING_URL_CACHING_PREFIX+ movieId;
-
-        //check redis cache first
-        String cachedUrl= redisTemplate.opsForValue().get(cacheKey);
-        if(cachedUrl!=null){
-            log.info("returning streaming url for movie: {}",movieId);
-            return new StreamingResponse(movieId,
-                    cachedUrl,
-                    "1080p, 720p, 480p, 360p",
-                    presignedUrlExpiry);
-        }
-
-        //generate presigned url for s3
-        log.info("Generating presigned Url for movie: {}",movieId);
-        String presignedUrl= generatePresignedUrl(playlistKey);
-
-        // cache in redis for 55 minutes
-        // (5 minutes less than actual expiry to avoid edge cases)
-        redisTemplate.opsForValue().set(
-                cacheKey,
-                presignedUrl,
-                55,
-                TimeUnit.MINUTES
-        );
-
-        log.info("Streaming url generated and cached for movie: {}",movieId);
+     * Returns the URL of OUR playlist endpoint for the master playlist.
+     * The player loads this, and every playlist it fetches afterwards
+     * also comes from our endpoint, so every segment link gets signed.
+     */
+    public StreamingResponse getStreamingUrl(String movieId, String masterPlaylistKey) {
+        log.info("Building streaming url for movie: {}", movieId);
         return new StreamingResponse(
                 movieId,
-                presignedUrl,
+                playlistUrl(movieId, masterPlaylistKey),
                 "1080p, 720p, 480p, 360p",
                 presignedUrlExpiry
         );
+    }
 
+    public String getSignedPlaylist(String movieId, String playlistPath) {
+        String prefix = "encoded/" + movieId + "/";
 
+        // Only allow .m3u8 files inside this movie's own folder
+        if (!isValidPlaylistPath(prefix, playlistPath)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid playlist path");
+        }
+
+        String basePath = playlistPath.substring(0, playlistPath.lastIndexOf('/') + 1);
+
+        String content;
+        try {
+            content = readFromS3(playlistPath);
+        } catch (NoSuchKeyException e) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Playlist not found");
+        }
+
+        return rewritePlaylist(movieId, content, basePath);
+    }
+
+    private boolean isValidPlaylistPath(String prefix, String path) {
+        return path != null
+                && path.startsWith(prefix)
+                && path.endsWith(".m3u8")
+                && !path.contains("..")
+                && !path.contains("\\");
     }
 
     /*
-    * Generate a presigned URL for S3 object
-    * it expires after the allotted time.
-    */
-    private String generatePresignedUrl(String playlistKey) {
-        GetObjectRequest getObjectRequest= GetObjectRequest.builder()
-                .bucket(bucketName)
-                .key(playlistKey)
-                .build();
+     * .m3u8 entries -> point back to our /playlist endpoint
+     * .ts entries   -> presigned S3 URL
+     */
+    private String rewritePlaylist(String movieId, String content, String basePath) {
+        StringBuilder out = new StringBuilder();
 
-        GetObjectPresignRequest getObjectPresignRequest= GetObjectPresignRequest.builder()
-                .signatureDuration(Duration.ofMinutes(presignedUrlExpiry))
-                .getObjectRequest(getObjectRequest).build();
+        for (String line : content.split("\\r?\\n")) {
+            String trimmed = line.trim();
 
-        return s3Presigner.presignGetObject(getObjectPresignRequest)
-                .url()
-                .toString();
-
-    }
-
-    private String rewriteM3u8SignedUrls(String m3u8Content, String basePath){
-        StringBuilder rewritten= new StringBuilder();
-        for(String line: m3u8Content.split("\n")){
-            String trimmed= line.trim();
-
-            //skip empty lines and comments
-            if(trimmed.isEmpty() || trimmed.startsWith("#")){
-                rewritten.append(line).append('\n');
+            if (trimmed.isEmpty() || trimmed.startsWith("#")) {
+                out.append(line).append('\n');
                 continue;
             }
 
-            //this is a segment or playlist reference
-            //build full s3 key and sign it
+            if (trimmed.contains("..") || trimmed.startsWith("/") || trimmed.contains("://")) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Unsafe playlist entry");
+            }
 
-            String fullKey= basePath+trimmed;
-            String signedUrl= generatePresignedUrl(fullKey);
-
-            rewritten.append(signedUrl).append('\n');
+            String fullKey = basePath + trimmed;
+            if (trimmed.endsWith(".m3u8")) {
+                out.append(playlistUrl(movieId, fullKey));
+            } else {
+                out.append(presign(fullKey));
+            }
+            out.append('\n');
         }
-        return rewritten.toString();
+        return out.toString();
     }
 
-    /*
-    * Read file content from S3
-    */
+    private String playlistUrl(String movieId, String key) {
+        return publicBaseUrl + "/api/v1/stream/" + movieId + "/playlist?path="
+                + URLEncoder.encode(key, StandardCharsets.UTF_8);
+    }
 
-    private String readFromS3(String s3Key){
-        GetObjectRequest request= GetObjectRequest.builder()
+    private String presign(String key) {
+        GetObjectRequest getObjectRequest = GetObjectRequest.builder()
                 .bucket(bucketName)
-                .key(s3Key)
+                .key(key)
                 .build();
-        ResponseInputStream<GetObjectResponse> response= s3Client.getObject(request);
 
-        return new BufferedReader(new InputStreamReader(response)).lines()
-                .collect(Collectors.joining("\n"));
+        GetObjectPresignRequest presignRequest = GetObjectPresignRequest.builder()
+                .signatureDuration(Duration.ofMinutes(presignedUrlExpiry))
+                .getObjectRequest(getObjectRequest)
+                .build();
+
+        return s3Presigner.presignGetObject(presignRequest).url().toString();
     }
 
-    public String getSignedPlaylist(String movieId, String playlistPath){
-
-        //get base path for this playlist
-        String basePath= playlistPath.substring(
-                0, playlistPath.lastIndexOf('/')+1
-        );
-
-        //read m3u8 content from s3
-        String m3u8Content= readFromS3(playlistPath);
-
-        //rewrite each line that is a segment or playlist reference
-        String signedContent= rewriteM3u8SignedUrls(m3u8Content,basePath);
-        return signedContent;
-    }
-
-    /*
-    * Invalidate cache streaming url
-    * Called when video is re-encoded or updated
-    * */
-
-    public void invalidateString(String movieId){
-        String cacheKey= STREAMING_URL_CACHING_PREFIX+movieId;
-        redisTemplate.delete(cacheKey);
-
-        log.info("Streaming URL cache invalidated for movie: {}",movieId);
+    // getObjectAsBytes closes the connection for us (the old version leaked it)
+    private String readFromS3(String key) {
+        GetObjectRequest request = GetObjectRequest.builder()
+                .bucket(bucketName)
+                .key(key)
+                .build();
+        return s3Client.getObjectAsBytes(request).asUtf8String();
     }
 }
