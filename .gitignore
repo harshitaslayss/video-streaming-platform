@@ -1,0 +1,16 @@
+# IntelliJ
+.idea/
+.ideabackup/
+
+# Maven
+**/target/
+
+# Environment
+.env
+*.env
+
+# Logs
+*.log
+
+# Test videos
+*.mp4
