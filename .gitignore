@@ -3,6 +3,7 @@
 .ideabackup/
 
 # Maven
+target/
 **/target/
 
 # Environment
@@ -11,6 +12,10 @@
 
 # Logs
 *.log
+
+# Node
+node_modules/
+*/node_modules/
 
 # Test videos
 *.mp4
